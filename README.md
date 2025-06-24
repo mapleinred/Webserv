@@ -269,3 +269,108 @@ This allows you to serve dynamic content (like database queries, form handling, 
 - **Purpose**: Main server class, integrates all components and manages the server lifecycle.
 - **Key Functions**:
   - `run()`: Main loop for running the server.
+
+---
+
+## Chunked Transfer Encoding Explained
+
+Chunked transfer encoding is a mechanism in HTTP/1.1 that allows the server to send data in a series of chunks, useful when the total size of the response is not known in advance (for example, when generating dynamic content).
+
+### How Chunked Encoding Works
+1. **Server Response**: When the server wants to use chunked encoding, it sets the header:
+   ```
+   Transfer-Encoding: chunked
+   ```
+2. **Sending Chunks**: The response body is sent in a series of chunks. Each chunk is preceded by its size in hexadecimal, followed by a CRLF (carriage return and line feed), then the chunk data, and another CRLF. For example:
+   ```
+   4\r\n
+   Wiki\r\n
+   5\r\n
+   pedia\r\n
+   0\r\n
+   \r\n
+   ```
+   - `4\r\nWiki\r\n` means a chunk of 4 bytes: "Wiki"
+   - `5\r\npedia\r\n` means a chunk of 5 bytes: "pedia"
+   - `0\r\n\r\n` signals the end of the response
+3. **End of Message**: The last chunk is always size 0, indicating the end of the response.
+
+### How the Server Checks and Handles Chunked Messages
+- **Outgoing (Server to Client):**
+  - The server checks if the response should be chunked (e.g., dynamic CGI output or unknown content length).
+  - If so, it formats the response body in chunks as described above.
+- **Incoming (Client to Server):**
+  - For HTTP requests with chunked bodies (rare, but possible for POST), the server reads each chunk, assembles the full body, and processes it as normal.
+- **Unchunking:**
+  - The server (or client) reads the chunk size, then reads that many bytes, repeating until a chunk of size 0 is received.
+  - The chunks are concatenated to reconstruct the original message body.
+
+### Why Use Chunked Encoding?
+- Allows the server to start sending a response before knowing its total size.
+- Useful for streaming data or dynamically generated content.
+
+---
+
+## Project Requirements Checklist
+
+### General Rules
+- The program must never crash or quit unexpectedly, even on memory errors.
+- Provide a Makefile with at least the following rules: `$(NAME)`, `all`, `clean`, `fclean`, `re`.
+- Use `c++` with `-Wall -Wextra -Werror` flags and ensure C++98 compliance (`-std=c++98`).
+- Prefer C++ standard library features over C functions when possible.
+- No external or Boost libraries allowed.
+
+### Mandatory Features
+- **Program Name:** `webserv`
+- **Files to Turn In:** Makefile, all headers (`*.h`, `*.hpp`), sources (`*.cpp`, `*.tpp`, `*.ipp`), configuration files.
+- **Arguments:** Accepts a configuration file as an argument (or uses a default path).
+- **External Functions:** Only allowed to use standard C++98 and specified system calls (e.g., `execve`, `dup`, `pipe`, `fork`, `socket`, `select`, `poll`, `epoll`, `kqueue`, `accept`, `listen`, `send`, `recv`, `fcntl`, `close`, `read`, `write`, `waitpid`, `signal`, `stat`, `open`, `opendir`, `readdir`, `closedir`, etc.).
+- **Libft:** Allowed.
+
+### HTTP Server Requirements
+- Must be a fully functional HTTP server in C++98.
+- Must be non-blocking and use only one `poll()` (or equivalent) for all I/O (including `listen`).
+- `poll()` (or equivalent) must check both read and write at the same time.
+- Never read/write without going through `poll()` (or equivalent).
+- Never check `errno` after read/write.
+- Must be compatible with modern web browsers.
+- HTTP response status codes must be accurate.
+- Must provide default error pages if none are configured.
+- Only use `fork()` for CGI execution.
+- Must serve static websites.
+- Must support file uploads from clients.
+- Must implement at least GET, POST, and DELETE methods.
+- Must be resilient under stress tests and remain available.
+- Must support listening on multiple ports (configurable).
+
+### Configuration File Requirements
+- Inspired by NGINX's `server` block.
+- Must allow:
+  - Choosing port and host for each server.
+  - Setting server names.
+  - Defining default server for a host:port.
+  - Setting up default error pages.
+  - Limiting client body size.
+  - Defining routes with:
+    - Accepted HTTP methods
+    - HTTP redirection
+    - Root directory or file mapping
+    - Directory listing on/off
+    - Default file for directory requests
+    - CGI execution based on file extension
+    - File upload support and upload directory configuration
+- Must work with at least one CGI (e.g., Python, PHP, etc.).
+- Must provide configuration and default files to demonstrate all features.
+
+### CGI and Chunked Transfer
+- For chunked requests, the server must unchunk before passing to CGI.
+- For CGI output, if no `Content-Length` is returned, EOF marks the end of data.
+- CGI should be called with the requested file as the first argument and run in the correct directory.
+
+### MacOS Specific
+- May use `fcntl()` with `F_SETFL`, `O_NONBLOCK`, and `FD_CLOEXEC` only.
+- All file descriptors must be non-blocking.
+
+### Bonus Features (Optional)
+- Cookie and session management.
+- Support for multiple CGI.
