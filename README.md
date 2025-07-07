@@ -20,6 +20,10 @@
 - [Testing](#testing)
 - [Learning Resources](#learning-resources)
 - [Tips for Writing Your Own HTTP Server](#tips-for-writing-your-own-http-server)
+- [Project Architecture Analysis](#project-architecture-analysis)
+- [Advanced Features Implementation](#advanced-features-implementation)
+- [Performance Considerations](#performance-considerations)
+- [Security Features](#security-features)
 
 ---
 
@@ -260,12 +264,12 @@ Chunked transfer encoding is a mechanism in HTTP/1.1 that allows the server to s
 3. **End of Message**: The last chunk is always size 0, indicating the end of the response.
 
 ### How the Server Checks and Handles Chunked Messages
-- **Outgoing (Server to Client):**
+- **Outgoing (Server to Client)**:
   - The server checks if the response should be chunked (e.g., dynamic CGI output or unknown content length).
   - If so, it formats the response body in chunks as described above.
-- **Incoming (Client to Server):**
+- **Incoming (Client to Server)**:
   - For HTTP requests with chunked bodies (rare, but possible for POST), the server reads each chunk, assembles the full body, and processes it as normal.
-- **Unchunking:**
+- **Unchunking:**:
   - The server (or client) reads the chunk size, then reads that many bytes, repeating until a chunk of size 0 is received.
   - The chunks are concatenated to reconstruct the original message body.
 
@@ -375,3 +379,648 @@ Open your browser and navigate to `http://localhost:8080/`.
 - Test each feature thoroughly (use curl, browsers, and scripts).
 - Read and understand the HTTP and CGI specifications.
 - Handle errors gracefully and provide useful logs.
+
+---
+
+## Project Architecture Analysis
+
+### Overall Design Philosophy
+
+This HTTP server follows a **non-blocking, event-driven architecture** using epoll on Linux systems. The core design principles include:
+
+- **Single-threaded with event multiplexing**: Uses one epoll instance to handle all I/O operations
+- **State machine-based parsing**: HTTP requests are parsed through well-defined states
+- **Modular component design**: Separation of concerns across different classes
+- **Configuration-driven behavior**: NGINX-inspired configuration system
+- **Process isolation for CGI**: Fork-based CGI execution for security and stability
+
+### Core Components Architecture
+
+```
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   main.cpp      │────│  ConfigFile     │────│  ServerInfo     │
+│ (Entry Point)   │    │  (Config Parser)│    │  (Server Data)  │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+         │                       │                       │
+         │                       │                       │
+         ▼                       ▼                       ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   Client        │────│      CGI        │────│   SocketBuffer  │
+│ (Connection     │    │  (Script Exec)  │    │  (Buffer Mgmt)  │
+│  Management)    │    │                 │    │                 │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+---
+
+## Detailed Component Analysis
+
+### 1. Main Server Loop (`main.cpp`)
+
+**Purpose**: Entry point that orchestrates the entire server lifecycle.
+
+**Key Functions & Implementation**:
+
+- **`sigchldHandler(int sig)`**: 
+  - Handles zombie process cleanup for CGI execution
+  - Uses `waitpid(-1, NULL, WNOHANG)` for non-blocking child reaping
+  - Prevents accumulation of zombie processes
+
+- **`main()` Function Flow**:
+  1. **Signal Setup**: Installs `SIGCHLD` handler and ignores `SIGPIPE`
+  2. **Configuration Loading**: Parses config file and creates `ServerInfo` objects
+  3. **Socket Initialization**: Creates listening sockets for each server block
+  4. **Epoll Setup**: Initializes epoll instance for event-driven I/O
+  5. **Main Event Loop**: Continuously processes network events
+
+**Event Loop Architecture**:
+```cpp
+while (1) {
+    nfds = epoll_wait(Client::getEpollfd(), events.data(), events.size(), -1);
+    for (int i = 0; i < nfds; ++i) {
+        if (events[i].data.fd > max_connfd) {
+            // Handle existing client data (read/write)
+            client->socketRecv() / client->socketSend()
+        } else {
+            // Accept new connection
+            sockfd = accept(events[i].data.fd, &addr, &addrlen);
+            // Create new Client object
+        }
+    }
+    // Cleanup closed connections
+    // Process CGI zombie processes
+}
+```
+
+### 2. Configuration Management (`ConfigFile.hpp/cpp`)
+
+**Purpose**: Parses NGINX-style configuration files and stores server settings.
+
+**Key Data Structures**:
+
+- **`ServerInfo`**: Contains complete server configuration
+  ```cpp
+  struct ServerInfo {
+      std::vector<int> connfds;           // Listening socket FDs
+      std::vector<RouteInfo> routes;      // Location blocks
+      std::vector<std::string> names;     // Server names
+      std::vector<std::pair<std::string, std::string>> ip_addrs; // Host:port pairs
+      static std::map<int, std::string> error_pages;  // Error page mappings
+      static size_t max_bodysize;         // Maximum request body size
+  };
+  ```
+
+- **`RouteInfo`**: Defines behavior for specific URL paths
+  ```cpp
+  struct RouteInfo {
+      bool dir_list;                      // Enable directory listing
+      int http_methods;                   // Allowed HTTP methods (bitmask)
+      std::string root;                   // Document root path
+      std::string dfl_file;              // Default index file
+      std::string redirect;              // Redirect URL
+      std::string upload_dir;            // Upload directory
+      std::string prefix_str;            // URL prefix to match
+      std::vector<std::string> cgi_extensions; // CGI file extensions
+  };
+  ```
+
+**Parsing Implementation**:
+- **Token-based parsing**: Uses keyword-value pairs separated by '='
+- **Context-aware**: Supports nested `server` and `location` blocks
+- **Error handling**: Validates configuration syntax and throws exceptions
+- **Method bitmasks**: Uses bit flags for HTTP method permissions
+
+### 3. Client Connection Management (`Client.hpp/cpp`)
+
+**Purpose**: Manages individual client connections through their entire lifecycle.
+
+**State Machine Design**:
+
+The Client class implements two interrelated state machines:
+
+**Parse States** (HTTP parsing progression):
+```cpp
+enum ParseState {
+    ERROR = -1,      // Parse error occurred
+    START_LINE,      // Parsing "GET /path HTTP/1.1"
+    HEADERS,         // Parsing HTTP headers
+    MSG_BODY,        // Reading request body (POST)
+    FINISHED,        // Ready to generate response
+};
+```
+
+**I/O States** (Communication flow):
+```cpp
+enum IOState {
+    RECV_HTTP = 0,   // Receiving HTTP request from client
+    SEND_HTTP,       // Sending HTTP response to client
+    RECV_CGI,        // Receiving output from CGI script
+    SEND_CGI,        // Sending input to CGI script
+    CONN_CLOSED,     // Connection terminated
+};
+```
+
+**Key Methods & Implementation**:
+
+- **`socketRecv()`**: 
+  - Handles incoming data based on current I/O state
+  - Non-blocking receive using `MSG_DONTWAIT`
+  - Routes data to HTTP parser or CGI handler
+  
+- **`socketSend()`**:
+  - Sends response data incrementally
+  - Tracks send progress with iterators
+  - Handles partial sends gracefully
+
+- **`parseHttpRequest()`**:
+  - Implements incremental HTTP parsing
+  - Handles chunked transfer encoding
+  - Validates HTTP compliance
+
+### 4. HTTP Request Processing (`ClientParseHttp.cpp`, `ClientPerformRequest.cpp`)
+
+**HTTP Parsing Flow**:
+
+1. **Start Line Parsing** (`parseStartLine()`):
+   - Extracts HTTP method, URI, and version
+   - Validates method support (GET, POST, DELETE)
+   - Finds matching route configuration
+   - Resolves file paths and checks permissions
+
+2. **Header Parsing** (`parseHeaders()`):
+   - Builds header map from key-value pairs
+   - Validates Host header for virtual hosting
+   - Configures transfer encoding (chunked/content-length)
+   - Determines if request body expected
+
+3. **Body Processing** (`parseMsgBody()`):
+   - Handles Content-Length based body reading
+   - Implements chunked encoding decoder
+   - Enforces maximum body size limits
+
+**Request Processing Flow**:
+
+1. **Path Resolution** (`filterRequestUri()`):
+   - Extracts query parameters and path info
+   - Handles directory requests with index files
+   - Checks for CGI extensions
+   - Sanitizes paths to prevent directory traversal
+
+2. **Method Handlers**:
+   - **GET**: Serves static files or directory listings
+   - **POST**: Handles file uploads and form data
+   - **DELETE**: Removes specified files
+
+### 5. CGI Script Execution (`Cgi.hpp/cpp`, `ClientRunCgi.cpp`)
+
+**Purpose**: Executes external scripts to generate dynamic content.
+
+**CGI Architecture**:
+```
+Client Process                    CGI Process
+┌─────────────────┐              ┌─────────────────┐
+│                 │  socketpair  │                 │
+│   HTTP Parser   │◄────────────►│  Script Engine  │
+│                 │              │                 │
+└─────────────────┘              └─────────────────┘
+```
+
+**Implementation Details**:
+
+- **`runCgiScript()`**:
+  - Creates bidirectional socket pair using `socketpair()`
+  - Forks child process to execute the CGI script
+  - Registers CGI socket with epoll for event handling
+  - Creates CGI object to manage communication
+
+- **`executeCgi()`** (Child Process):
+  - Changes directory to script location
+  - Sets up environment variables (REQUEST_METHOD, QUERY_STRING, etc.)
+  - Redirects stdin/stdout to socket pair
+  - Executes script using `execve()`
+
+- **Environment Setup** (`initCgiEnv()`):
+  - Converts HTTP headers to CGI environment variables
+  - Sets standard CGI variables (PATH_INFO, CONTENT_LENGTH)
+  - Handles file upload directory configuration
+
+**CGI Communication Flow**:
+1. **POST Requests**: Send body data to script's stdin
+2. **Script Processing**: CGI script processes input and generates output
+3. **Response Parsing**: Parse CGI output headers and body
+4. **Client Response**: Forward processed data to HTTP client
+
+### 6. Error Handling and HTTP Status Codes
+
+**Error State Management**:
+- **Graceful degradation**: Invalid requests generate appropriate HTTP error responses
+- **Custom error pages**: Configurable HTML pages for different error codes
+- **Logging**: Debug output for troubleshooting (can be disabled)
+
+**Supported Status Codes**:
+- **2xx Success**: 200 (OK), 204 (No Content)
+- **3xx Redirection**: 301 (Moved Permanently)
+- **4xx Client Error**: 400 (Bad Request), 403 (Forbidden), 404 (Not Found), 405 (Method Not Allowed), 409 (Conflict), 413 (Content Too Large), 414 (URI Too Long)
+- **5xx Server Error**: 500 (Internal Server Error), 501 (Not Implemented), 505 (HTTP Version Not Supported)
+
+---
+
+## Advanced Features Implementation
+
+### Chunked Transfer Encoding
+
+**Outgoing (Server to Client)**:
+- Automatic chunking for CGI responses without Content-Length
+- Proper chunk formatting with hexadecimal size headers
+- Zero-length chunk termination
+
+**Incoming (Client to Server)**:
+- Chunk size parsing and validation
+- Reassembly of chunked request bodies
+- Unchunking before CGI processing
+
+### Virtual Host Support
+
+- **Host header validation**: Matches incoming requests to server configurations
+- **Server name matching**: Supports multiple server names per configuration
+- **Default server selection**: Falls back to first server if no match found
+
+### File Upload Handling
+
+- **Multipart form data**: Supports file uploads via POST requests
+- **Upload directory configuration**: Configurable destination directories
+- **Size limits**: Enforces maximum body size restrictions
+
+### Connection Management
+
+- **Keep-alive support**: Handles persistent connections
+- **Timeout handling**: Closes inactive connections
+- **Resource cleanup**: Proper file descriptor and memory management
+
+---
+
+## Performance Considerations
+
+### Non-blocking I/O
+- All socket operations use `MSG_DONTWAIT` flag
+- Epoll edge-triggered mode for efficient event notification
+- Incremental parsing to handle partial requests
+
+### Memory Management
+- Buffer reuse and efficient string operations
+- Iterator-based sending to avoid large memory copies
+- Automatic cleanup of closed connections
+
+### Process Management
+- Fork only for CGI execution (minimal process overhead)
+- Proper zombie process cleanup
+- Signal handling for robust operation
+
+---
+
+## Security Features
+
+### Path Sanitization
+- `realpath()` and `canonicalize_file_name()` for path resolution
+- Prevention of directory traversal attacks
+- Access permission checking
+
+### CGI Isolation
+- Process isolation through forking
+- Working directory changes for script execution
+- Environment variable sanitization
+
+### Input Validation
+- HTTP protocol compliance checking
+- Header size and count limits
+- Request body size restrictions
+
+---
+
+## Technical Implementation Highlights
+
+### Advanced HTTP Features
+
+#### Chunked Transfer Encoding Implementation
+
+**Encoding (Server to Client)**:
+```cpp
+// In CGI response handling:
+// 1. When CGI doesn't provide Content-Length
+// 2. Format: [hex-size]\r\n[data]\r\n...\0\r\n\r\n
+// 3. Automatic chunking for dynamic content
+
+std::string formatChunk(const std::string& data) {
+    std::ostringstream oss;
+    oss << std::hex << data.size() << "\r\n";
+    oss << data << "\r\n";
+    return oss.str();
+}
+```
+
+**Decoding (Client to Server)**:
+```cpp
+// In request body parsing:
+// 1. Parse hex chunk size
+// 2. Read exactly that many bytes
+// 3. Concatenate chunks until size 0
+// 4. Reconstruct original message body
+
+int unchunkRequest() {
+    // Parse chunk size from hex
+    // Read chunk data
+    // Append to message body
+    // Continue until zero-sized chunk
+}
+```
+
+#### Virtual Host Implementation
+
+**Host Header Processing**:
+```cpp
+// 1. Extract Host header from request
+// 2. Match against configured server names
+// 3. Fall back to IP:port matching
+// 4. Use default server if no match
+
+int checkServerName() {
+    std::string hostHeader = _headers["Host"];
+    // Check server names first
+    for (auto& name : _server.names) {
+        if (hostHeader.find(name) != std::string::npos) {
+            return 0; // Match found
+        }
+    }
+    // Check IP:port combinations
+    // Return 404 if no match
+}
+```
+
+### Memory Management Strategy
+
+#### Buffer Management
+- **Receive buffers**: Dynamic string buffers that grow as needed
+- **Send buffers**: Iterator-based progressive sending
+- **File buffers**: Efficient file content streaming
+- **CGI buffers**: Separate buffers for CGI communication
+
+#### Resource Cleanup
+```cpp
+// RAII-style resource management:
+class Client {
+    ~Client() {
+        closeFds();     // Close all file descriptors
+        cleanup();      // Free allocated memory
+    }
+};
+
+// Static cleanup for server shutdown:
+void signalHandler(int sig) {
+    Client::closeOpenFds();    // Close all tracked FDs
+    exit(0);
+}
+```
+
+### Event-Driven Architecture Details
+
+#### Epoll Integration
+```cpp
+// Event registration for new connections:
+void registerEvent(int fd, uint32_t events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+// Event modification for state changes:
+void modifyEvent(int fd, uint32_t events) {
+    struct epoll_event ev;
+    ev.events = events;
+    ev.data.fd = fd;
+    epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &ev);
+}
+```
+
+#### State Transition Management
+```cpp
+// Client state transitions:
+RECV_HTTP -> parseRequest() -> SEND_HTTP
+RECV_HTTP -> parseRequest() -> SEND_CGI -> RECV_CGI -> SEND_HTTP
+
+// Each transition updates epoll events accordingly
+void setIOState(int newState) {
+    _iostate = newState;
+    switch (newState) {
+        case RECV_HTTP:
+            registerEvent(_clientfd, EPOLLIN);
+            break;
+        case SEND_HTTP:
+            registerEvent(_clientfd, EPOLLOUT);
+            break;
+        // ... other states
+    }
+}
+```
+
+### CGI Security and Isolation
+
+#### Process Isolation
+```cpp
+// Fork creates isolated process:
+switch (fork()) {
+    case 0: // Child process
+        // Change working directory
+        chdir(_route->root.c_str());
+        
+        // Set up minimal environment
+        clearenv();
+        setEnvVariables();
+        
+        // Execute with minimal privileges
+        execve(scriptPath, argv, envp);
+        break;
+        
+    default: // Parent process
+        // Continue serving other clients
+        // Monitor child via SIGCHLD
+}
+```
+
+#### Environment Sanitization
+```cpp
+// Only safe environment variables are passed:
+std::vector<char*> initCgiEnv() {
+    std::vector<char*> env;
+    
+    // Standard CGI variables only
+    env.push_back(strdup("REQUEST_METHOD=GET"));
+    env.push_back(strdup("QUERY_STRING=..."));
+    env.push_back(strdup("CONTENT_LENGTH=..."));
+    
+    // No system environment inheritance
+    // No PATH modification
+    // No dangerous variables
+    
+    return env;
+}
+```
+
+---
+
+## Project Development Journey and Lessons Learned
+
+### Design Evolution
+
+#### Initial Approach vs Final Implementation
+
+**Original Design**: Simple socket-based server with basic file serving
+**Evolution**: Full HTTP/1.1 compliant server with CGI support
+
+**Key Design Decisions**:
+1. **Event-driven architecture**: Chosen for scalability over threaded model
+2. **State machine parsing**: Ensures robust HTTP protocol handling
+3. **Process isolation for CGI**: Security and stability over performance
+4. **Configuration-driven behavior**: Flexibility for different use cases
+
+#### Technical Challenges Overcome
+
+**1. Non-blocking I/O Complexity**:
+- **Challenge**: Managing partial reads/writes
+- **Solution**: Iterator-based progressive processing
+- **Learning**: Importance of state tracking in network programming
+
+**2. CGI Integration**:
+- **Challenge**: Bidirectional communication with external processes
+- **Solution**: Socketpair-based IPC with epoll integration
+- **Learning**: Process management and IPC mechanisms
+
+**3. HTTP Protocol Compliance**:
+- **Challenge**: Handling all HTTP edge cases and malformed requests
+- **Solution**: Strict state machine with comprehensive error handling
+- **Learning**: Protocol implementation requires meticulous attention to detail
+
+**4. Memory Management**:
+- **Challenge**: Preventing leaks in long-running server
+- **Solution**: RAII principles and careful resource tracking
+- **Learning**: System programming requires disciplined resource management
+
+### Code Quality and Best Practices
+
+#### C++98 Compliance
+- **No modern C++ features**: Standard library algorithms and containers only
+- **Manual memory management**: No smart pointers, careful new/delete pairing
+- **Iterator usage**: Extensive use of STL iterators for efficiency
+- **Function objects**: Using std::bind2nd and std::mem_fun_ref
+
+#### Error Handling Strategy
+```cpp
+// Comprehensive error checking:
+if (socketcall() == -1) {
+    perror("socketcall");
+    // Graceful degradation
+    return error_response();
+}
+
+// Exception safety:
+try {
+    risky_operation();
+} catch (std::exception& e) {
+    cleanup_resources();
+    log_error(e.what());
+    return error_state();
+}
+```
+
+#### Performance Optimizations
+- **Minimal copying**: Use of iterators and references
+- **Buffer reuse**: Avoiding frequent allocations
+- **Efficient algorithms**: O(log n) lookups where possible
+- **System call optimization**: Batching operations when possible
+
+---
+
+## Future Enhancement Opportunities
+
+### Potential Improvements
+
+#### Performance Enhancements
+1. **Connection pooling**: Reuse connections for keep-alive
+2. **Buffer optimization**: Circular buffers for reduced copying
+3. **Sendfile support**: Zero-copy file transfers
+4. **Compression**: Gzip compression for text content
+
+#### Feature Extensions
+1. **HTTPS support**: SSL/TLS encryption
+2. **HTTP/2 support**: Modern protocol features
+3. **WebSocket support**: Real-time communication
+4. **Authentication**: Basic/digest authentication
+
+#### Scalability Improvements
+1. **Multi-threading**: Thread pool for CPU-intensive tasks
+2. **Process pooling**: Pre-forked CGI processes
+3. **Load balancing**: Multiple server instances
+4. **Caching**: Static content caching
+
+### Architecture Refinements
+
+#### Code Organization
+1. **Module separation**: Better separation of concerns
+2. **Plugin architecture**: Loadable modules for extensions
+3. **Configuration API**: Runtime configuration changes
+4. **Monitoring API**: Built-in performance metrics
+
+#### Testing Framework
+1. **Unit test suite**: Automated testing for all components
+2. **Integration tests**: End-to-end scenario testing
+3. **Performance benchmarks**: Automated performance regression testing
+4. **Fuzzing**: Automated security testing
+
+---
+
+## Summary and Conclusion
+
+### Project Achievements
+
+This HTTP server implementation successfully demonstrates:
+
+1. **Complete HTTP/1.1 compliance**: Proper handling of methods, headers, and status codes
+2. **CGI integration**: Dynamic content generation through external script execution
+3. **Configuration flexibility**: NGINX-inspired configuration system
+4. **Robust error handling**: Graceful handling of all error conditions
+5. **Performance optimization**: Event-driven, non-blocking architecture
+6. **Security awareness**: Input validation and process isolation
+
+### Technical Mastery Demonstrated
+
+#### Systems Programming Skills
+- **Network programming**: Socket management, epoll usage
+- **Process management**: Fork/exec, signal handling, IPC
+- **File system operations**: File access, directory manipulation
+- **Memory management**: Efficient allocation and deallocation
+
+#### Software Engineering Practices
+- **Modular design**: Clean separation of responsibilities
+- **Error handling**: Comprehensive error detection and recovery
+- **Resource management**: Proper cleanup and leak prevention
+- **Documentation**: Thorough code documentation and user guides
+
+#### Protocol Implementation
+- **HTTP/1.1 standard**: Full compliance with RFC specifications
+- **CGI standard**: Proper environment setup and communication
+- **Chunked encoding**: Correct implementation of transfer encoding
+- **Virtual hosting**: Multi-domain server capability
+
+### Educational Value
+
+This project serves as an excellent learning resource for:
+
+1. **Understanding web servers**: How HTTP servers actually work internally
+2. **Network programming**: Practical application of socket programming
+3. **System-level programming**: Process management and IPC
+4. **Protocol implementation**: Real-world protocol compliance
+5. **Software architecture**: Scalable, maintainable system design
+
+The codebase demonstrates that building a production-quality HTTP server requires careful attention to protocol details, robust error handling, efficient resource management, and thoughtful architectural decisions. This implementation provides a solid foundation for understanding how modern web servers operate and can serve as a starting point for more advanced features and optimizations.
+
+---
